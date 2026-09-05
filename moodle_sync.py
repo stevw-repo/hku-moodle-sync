@@ -164,8 +164,8 @@ class MoodleError(Exception):
         super().__init__(f"[{code}] {message}")
 
 
-def download(token, fileurl, dest):
-    """Fetch a pluginfile URL with the ws token appended."""
+def fetch(token, fileurl):
+    """Fetch a pluginfile URL with the ws token appended. Returns bytes."""
     parts = urllib.parse.urlsplit(fileurl)
     query = dict(urllib.parse.parse_qsl(parts.query))
     query["token"] = token
@@ -173,8 +173,6 @@ def download(token, fileurl, dest):
         (parts.scheme, parts.netloc, parts.path, urllib.parse.urlencode(query), "")
     )
     req = urllib.request.Request(url, headers={"User-Agent": UA})
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(dest.suffix + ".part")
     with urllib.request.urlopen(req, timeout=300) as resp:
         ctype = resp.headers.get("Content-Type", "")
         blob = resp.read()
@@ -185,9 +183,23 @@ def download(token, fileurl, dest):
             raise MoodleError(err.get("errorcode", "?"), err.get("error", "download failed"))
         except json.JSONDecodeError:
             pass
+    if "html" in ctype:
+        # An HTML body where a file was expected means the URL was not one the
+        # token is accepted on — see embedded_files() on the /pluginfile.php/ form.
+        raise MoodleError("nottoken", "got an HTML page instead of a file")
+    return blob
+
+
+def write_file(blob, dest):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
     tmp.write_bytes(blob)
     tmp.replace(dest)
     return len(blob)
+
+
+def download(token, fileurl, dest):
+    return write_file(fetch(token, fileurl), dest)
 
 
 # --------------------------------------------------------------------- helpers
@@ -198,14 +210,88 @@ def sanitise(name, fallback="untitled"):
     return name[:120] or fallback
 
 
-def strip_html(text, limit=400):
-    if not text:
+def visible_html(raw):
+    """Drop HTML comments before anything else reads the markup.
+
+    Lecturers hide last year's content by commenting it out rather than deleting
+    it. MATH2012's "Important Messages" summary is 4,199 characters of which
+    *every one* sits inside a comment: Zoom join links, a different tutor,
+    different tutorial groups, "after the Chinese New Year holiday". Strip tags
+    without handling comments and all of it resurfaces as though it were this
+    year's arrangements — worse, `<[^>]+>` shreds any comment containing tags,
+    leaking the text and leaving stray "-->" markers behind.
+    """
+    if not raw:
         return ""
-    text = re.sub(r"<br\s*/?>|</p>", " ", text, flags=re.I)
+    raw = re.sub(r"<!--.*?-->", "", raw, flags=re.S)
+    return re.sub(r"<!--.*$", "", raw, flags=re.S)   # unclosed comment: hide to the end
+
+
+def strip_html(text, limit=400):
+    """One-line summary of an HTML blob, for manifest entries."""
+    text = re.sub(r"<br\s*/?>|</p>", " ", visible_html(text), flags=re.I)
     text = re.sub(r"<[^>]+>", "", text)
     text = htmllib.unescape(text).replace("\xa0", " ")
     text = re.sub(r"\s+", " ", text).strip()
     return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def html_to_text(raw):
+    """Readable plain text from an HTML blob, keeping its line structure."""
+    text = re.sub(r"<br\s*/?>|</p>|</div>|</h[1-6]>|</tr>", "\n", visible_html(raw), flags=re.I)
+    text = re.sub(r"<li[^>]*>", "\n- ", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = htmllib.unescape(text).replace("\xa0", " ")
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(l.strip() for l in text.splitlines())).strip()
+
+
+EMBED_RE = re.compile(r'href="([^"]+/pluginfile\.php/[^"]+)"', re.I)
+
+
+def embedded_files(raw):
+    """(filename, url) for files linked from inside HTML, not posted as activities.
+
+    MATH2012 publishes its whole reading list this way — Course Information,
+    Writing Mathematics, Chapter 1 — as links in label text. Walking activity
+    contents alone finds nothing, which is why that course looked empty all
+    semester. The href carries the browser's /pluginfile.php/ form, which ignores
+    the token and returns an HTML error page; only the web-service form accepts
+    it, so rewrite the path.
+    """
+    out, seen = [], set()
+    for url in EMBED_RE.findall(visible_html(raw)):
+        url = url.split("?")[0].split("#")[0]
+        if "/webservice/pluginfile.php/" not in url:
+            url = url.replace("/pluginfile.php/", "/webservice/pluginfile.php/")
+        name = sanitise(urllib.parse.unquote(url.rsplit("/", 1)[-1]), "")
+        if name and url not in seen:
+            seen.add(url)
+            out.append((name, url))
+    return out
+
+
+def page_blocks(sections):
+    """(section, kind, text) for every piece of prose written on a course page.
+
+    Section summaries and label activities are where the things that carry a
+    penalty get written — assigned reading, registration deadlines, room
+    changes, who the lecturer actually is. None of it is a file, so none of it
+    was being captured.
+    """
+    blocks = []
+    for s in sections:
+        sname = (s.get("name") or "").strip()
+        body = html_to_text(s.get("summary"))
+        if body:
+            blocks.append((sname, "section text", body))
+        for mod in s.get("modules", []):
+            body = html_to_text(mod.get("description"))
+            if not body:
+                continue
+            kind = mod.get("modname", "")
+            title = (mod.get("name") or "").strip()
+            blocks.append((sname, kind if kind == "label" else f"{kind}: {title}", body))
+    return blocks
 
 
 def file_key(course_id, entry):
@@ -503,15 +589,26 @@ def cmd_sync(args):
     adopt_index, adopt_by_size = materials_index() if not args.no_adopt else ({}, {})
     started = datetime.now(timezone.utc).astimezone()
 
-    new_files, adopted, links, errors, dupes = [], [], [], [], []
-    used_dests = set()
+    new_files, adopted, links, errors, dupes, notices = [], [], [], [], [], []
+    used_dests, embed_fetched = set(), set()
+    page_seen = state.setdefault("page_text", {})
+
+    try:
+        shortnames = {str(c["id"]): c.get("shortname", "")
+                      for c in ws(token, "core_enrol_get_users_courses",
+                                  userid=cfg["userid"])}
+    except MoodleError:
+        shortnames = {}
 
     for cid, folder in sorted(mapping.items(), key=lambda kv: kv[1]):
         code = re.match(r"([A-Z]{4}\d{4})", folder)
         code = code.group(1) if code else folder
         if args.course and args.course.upper() not in (code.upper(), folder.upper()):
             continue
-        print(f"\n== {code} ({folder})")
+        shortname = shortnames.get(str(cid), "")
+        # Two Moodle courses can map to one folder — MATH2012 has a live _1AB and
+        # a dead _1A — so the heading has to say which one this is.
+        print(f"\n== {code} ({shortname or folder})")
         seen_content = {}       # per course; see plan_file() for what identity means
         try:
             sections = ws(token, "core_course_get_contents", courseid=int(cid))
@@ -520,8 +617,84 @@ def cmd_sync(args):
             errors.append(f"{code}: {exc}")
             continue
 
+        # Prose written on the course page. Reported when it first appears or
+        # changes, so a later sync surfaces "read §1.1-1.4 for Monday" rather
+        # than repeating the whole page every time.
+        known_hashes = set(page_seen.get(str(cid), []))
+        hashes_now = []
+        for sec_name, kind, body in page_blocks(sections):
+            h = hashlib.sha1(f"{sec_name}|{kind}|{body}".encode()).hexdigest()[:16]
+            hashes_now.append(h)
+            if h not in known_hashes:
+                notices.append({"course": code, "section": sec_name,
+                                "kind": kind, "text": body})
+        if not args.dry_run:
+            page_seen[str(cid)] = hashes_now
+        if notices and any(n["course"] == code for n in notices):
+            n = sum(1 for x in notices if x["course"] == code)
+            print(f"   ~ {n} new or changed note(s) on the course page")
+
         for si, section in enumerate(sections):
             sname = sanitise(section.get("name") or f"Section {si}", f"Section {si}")
+
+            # Files linked from inside HTML rather than posted as activities.
+            # Size is only knowable by fetching, so these are fetched up front
+            # and the bytes reused if the file turns out to be new.
+            for holder in [section.get("summary")] + [
+                    m_.get("description") for m_ in section.get("modules", [])]:
+                for fname, furl in embedded_files(holder):
+                    key = hashlib.sha1(f"embed|{cid}|{furl}".encode()).hexdigest()[:16]
+                    if key in known or furl in embed_fetched:
+                        continue
+                    try:
+                        blob = fetch(token, furl)
+                    except Exception as exc:
+                        print(f"   ! {fname}: {exc}")
+                        errors.append(f"{code}/{fname}: {exc}")
+                        embed_fetched.add(furl)
+                        continue
+                    embed_fetched.add(furl)
+                    entry = {"type": "file", "filename": fname,
+                             "filesize": len(blob), "fileurl": furl}
+                    action, detail = plan_file(
+                        entry, code, sanitise(f"{si:02d} {sname}"),
+                        vault=VAULT, inbox=INBOX, seen_content=seen_content,
+                        adopt_index=adopt_index, adopt_by_size=adopt_by_size,
+                        used_dests=used_dests,
+                    )
+                    if action == "skip":
+                        continue
+                    if action == "dup":
+                        known[key] = {"course": code, "filename": fname,
+                                      "duplicate_of": detail, "at": started.isoformat()}
+                        dupes.append({"course": code, "filename": fname, "of": detail})
+                        continue
+                    if action == "adopt":
+                        hit, renamed = detail
+                        known[key] = {"course": code, "filename": fname, "adopted": hit,
+                                      "renamed": renamed, "at": started.isoformat()}
+                        adopted.append({"course": code, "filename": fname,
+                                        "path": hit, "renamed": renamed})
+                        note = "  — filed under another name" if renamed else ""
+                        print(f"   = {fname}  (already in {hit}){note}")
+                        continue
+                    record = {
+                        "course": code, "folder": folder, "section": sname,
+                        "module": "(linked in page text)", "modname": "embedded",
+                        "filename": fname, "size": len(blob),
+                        "dest": str(detail.relative_to(VAULT)), "desc": "",
+                        "timemodified": None,
+                    }
+                    if args.dry_run:
+                        print(f"   + {fname}  ({human(len(blob))})  [dry run, embedded]")
+                        new_files.append(record)
+                        continue
+                    write_file(blob, detail)
+                    print(f"   + {fname}  ({human(len(blob))})  [embedded]")
+                    known[key] = {"course": code, "filename": fname,
+                                  "dest": record["dest"], "at": started.isoformat()}
+                    new_files.append(record)
+
             for module in section.get("modules", []):
                 modname = module.get("modname", "")
                 modtitle = module.get("name", "")
@@ -595,21 +768,23 @@ def cmd_sync(args):
 
     if args.dry_run:
         print(f"\nDry run: {len(new_files)} new file(s), {len(adopted)} already in "
-              f"Materials, {len(dupes)} duplicate upload(s) skipped.")
+              f"Materials, {len(dupes)} duplicate upload(s) skipped, "
+              f"{len(notices)} page note(s) new or changed.")
         return
 
     state["last_sync"] = started.isoformat()
     save_state(state)
-    if new_files or links:
-        write_manifest(started, new_files, adopted, links, errors, dupes)
+    if new_files or links or notices:
+        write_manifest(started, new_files, adopted, links, errors, dupes, notices)
     print(f"\n{len(new_files)} downloaded, {len(adopted)} adopted, "
-          f"{len(dupes)} duplicate(s) skipped, {len(errors)} error(s).")
+          f"{len(dupes)} duplicate(s) skipped, {len(notices)} page note(s), "
+          f"{len(errors)} error(s).")
     if new_files:
         print(f"Manifest: {MANIFEST.relative_to(VAULT)}")
         print('Now tell Claude: "ingest the Moodle inbox".')
 
 
-def write_manifest(started, new_files, adopted, links, errors, dupes=()):
+def write_manifest(started, new_files, adopted, links, errors, dupes=(), notices=()):
     INBOX.mkdir(parents=True, exist_ok=True)
     day = started.strftime("%Y-%m-%d %H:%M")
     out = [f"\n## Sync {day}\n"]
@@ -627,6 +802,23 @@ def write_manifest(started, new_files, adopted, links, errors, dupes=()):
                 if f["desc"]:
                     out.append(f"  - Description: {f['desc']}")
                 out.append(f"  - Suggested target: `{f['folder']}/Materials/` — topic folder TBD")
+            out.append("")
+
+    if notices:
+        out.append("### Written on the course page — new or changed\n")
+        out.append("Section text and labels: not files, so nothing to file, but this is "
+                   "where assigned reading, deadlines and room changes get announced. "
+                   "Hidden (commented-out) blocks are excluded.\n")
+        by_course = {}
+        for n in notices:
+            by_course.setdefault(n["course"], []).append(n)
+        for code, items in sorted(by_course.items()):
+            out.append(f"**{code}**\n")
+            for n in items:
+                head = f"{n['section']} · {n['kind']}" if n["section"] else n["kind"]
+                out.append(f"- *{head}*")
+                for line in n["text"].splitlines():
+                    out.append(f"  > {line}" if line.strip() else "  >")
             out.append("")
 
     if links:
