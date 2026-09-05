@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Never: the token lives in ~/.config/hku-moodle/, but guard against a stray copy.
+config.json
+token-url
